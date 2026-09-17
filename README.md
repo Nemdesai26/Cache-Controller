@@ -1,56 +1,113 @@
-# Two-Level Cache Controller (L1 + L2) — Verilog Behavioral Model
+# 🧠 Two-Level Cache Controller (L1 + L2)
 
-A Verilog model of a two-level cache hierarchy, built for a Computer Architecture course assignment. It simulates a processor's read/write requests flowing through an L1 cache, an L2 cache, and main memory — with realistic hit/miss behavior, multi-cycle access latencies, LRU replacement, and block promotion/eviction between levels.
+A **Verilog behavioral model** of a two-level cache hierarchy that demonstrates how a processor accesses data through **L1 Cache → L2 Cache → Main Memory**.
 
-## Overview
+The project focuses on **cache hits, misses, multi-cycle latency, LRU replacement, block promotion, eviction, and writeback** through simulation.
 
-The design models a classic memory hierarchy:
+## 📌 Cache Hierarchy
 
+```text
+                 Read / Write
+                     │
+                     ▼
+              ┌─────────────┐
+              │  Processor  │
+              └──────┬──────┘
+                     │
+                     ▼
+              ┌─────────────┐
+              │  L1 Cache   │
+              │ Direct Map  │
+              └──────┬──────┘
+                     │ Miss
+                     ▼
+              ┌─────────────┐
+              │  L2 Cache   │
+              │  4-Way Set  │
+              │ Associative │
+              └──────┬──────┘
+                     │ Miss
+                     ▼
+              ┌─────────────┐
+              │ Main Memory │
+              └─────────────┘
 ```
-Processor <--> L1 Cache <--> L2 Cache <--> Main Memory
+
+### Memory Specifications
+
+| Level | Organization | Size | Access Latency |
+|---|---|---:|---:|
+| **L1** | Direct-mapped | 64 lines × 4 bytes | 1 cycle |
+| **L2** | 4-way set-associative + LRU | 128 sets × 4 ways × 4 bytes | 3 cycles |
+| **Main Memory** | — | 16,384 blocks × 4 bytes (64 KB) | 10 cycles |
+
+## ⚙️ How It Works
+
+For every processor request:
+
+1. **Check L1** — Hit → return/update data. Miss → move to L2.
+2. **Check L2** — Hit → update LRU and promote the block to L1. Miss → access main memory.
+3. **Main Memory** — Fetch the block, install it into L2, then promote it to L1.
+4. When space is needed, the controller handles **eviction and writeback**.
+
+The controller also provides:
+- `hit1` → L1 hit indicator
+- `hit2` → L2 hit indicator
+- `Wait` → indicates that the request is still being serviced
+
+## 🧩 Key Concepts
+
+- **Cache Hit/Miss:** Searches the faster cache levels before accessing slower memory.
+- **LRU Replacement:** L2 replaces the least recently used block when a set is full.
+- **Block Promotion:** A block found in L2 is moved to L1 for faster future access.
+- **Eviction & Writeback:** Replaced blocks are written to the next memory level when required.
+- **Multi-Cycle Latency:** Different access times are modeled for L1, L2, and main memory.
+
+## 📊 Simulation Results
+
+The following waveforms show the cache controller during simulation.
+
+### Waveform 1
+
+![Cache Controller Simulation 1](Output/Cache_controller_1.png)
+
+### Waveform 2
+
+![Cache Controller Simulation 2](Output/Cache_controller_2.png)
+
+The waveforms show processor addresses/data and control signals such as hit detection, `Wait`, and cache operations.
+
+## 📁 Repository Structure
+
+```text
+├── Output/
+│   ├── Cache_controller_1.png
+│   └── Cache_controller_2.png
+│
+├── RTL Desgin/
+│   └── Cache controller RTL files
+│
+├── Testbench/
+│   └── Simulation / testbench files
+│
+└── README.md
 ```
 
-| Level | Organization | Size | Latency |
-|---|---|---|---|
-| L1 | Direct-mapped | 64 lines × 4 bytes | 1 cycle |
-| L2 | 4-way set-associative, LRU replacement | 128 sets × 4 ways × 4 bytes | 3 cycles |
-| Main Memory | — | 16384 blocks × 4 bytes (64 KB) | 10 cycles |
+## 🛠️ Implementation
 
-On every request, the controller:
-1. Checks L1 for a hit.
-2. On an L1 miss, waits out the L2 access latency, then checks all 4 ways of the relevant L2 set.
-3. On an L2 hit, updates LRU state for the set and promotes the block into L1 — evicting and writing back the current L1 occupant to L2 or main memory if needed.
-4. On an L2 miss, waits out the main memory latency, then fetches the block from main memory, installs it into L2 (evicting the LRU way if the set is full, with writeback to main memory if that victim was valid), and promotes it into L1 with the same eviction/writeback handling.
+**Language:** Verilog  
+**Type:** Behavioral / Functional Simulation  
+**Purpose:** Computer Architecture & Cache Memory Study
 
-Writes follow the same hit-search cascade (L1 → L2 → main memory) and update data in place at whichever level the block is found.
+> ⚠️ This is a **simulation model**, not synthesis-ready RTL. Behavioral constructs and hierarchical memory access are used to focus on demonstrating cache functionality.
 
-The controller exposes `hit1` / `hit2` signals (L1 and L2 hit indicators) and a `Wait` signal that tells the processor when the controller is still servicing a request, so back-to-back accesses are handled correctly.
+## 🎯 Simple Analogy
 
-## What this is (and isn't)
+> Think of **L1 as your desk**, **L2 as a nearby cupboard**, and **main memory as a storage room**.  
+> You check your desk first because it is fastest. If the item isn't there, you check the cupboard, and only then go to the storage room.
 
-This is a **functional/behavioral simulation model**, written to demonstrate correct cache hierarchy behavior — hit/miss timing, LRU replacement, and eviction/writeback logic — against a testbench. It is **not synthesizable RTL**. A few design choices make that explicit:
+## 👨‍💻 Author
 
-- Sub-modules (`L1_CACHE_MEMORY`, `L2_CACHE_MEMORY`, `MAIN_MEMORY`) are accessed via hierarchical (dot-notation) references rather than ports, which is valid in simulation but has no synthesis equivalent.
-- Multi-cycle access latencies are modeled with simple delay counters rather than a true register-level FSM.
-- Blocking assignments (`=`) are used throughout inside the clocked block, relying on same-cycle read-after-write ordering that isn't representative of real hardware timing.
-
-These were reasonable simplifications for the scope of the assignment (correctness of cache behavior over a testbench, not a tapeout-ready design), but would need to be addressed — proper module ports, a registered FSM, and non-blocking assignments for actual state — before this could be synthesized to real hardware.
-
-## Repository Contents
-
-- `cache_controller.v` — top-level cache controller module
-- (add: `l1_cache_memory.v`, `l2_cache_memory.v`, `main_memory.v`, testbench files, etc.)
-
-## Parameters
-
-Key configurable parameters (set via Verilog `parameter`s at the top of the module):
-
-- Address width, block offset width, byte size
-- L1: number of lines, tag/index widths
-- L2: number of ways, number of sets, tag/index widths
-- Main memory size
-- Access latencies for L1, L2, and main memory
-
-## Author
-
-Built as a Computer Architecture course assignment.
+**Nem Desai**  
+B.Tech. Electronics & Communication Engineering | Minor in Data Science  
+Nirma University
