@@ -1,518 +1,466 @@
 `timescale 1ns / 1ps
+`include "cache_pkg.vh"
+//////////////////////////////////////////////////////////////////////////////
 
-module CACHE_CONTROLLER(address,clk,data,mode,output_data,hit1, hit2,Wait, stored_address, stored_data);
+// Policy:
+//   - L1: direct-mapped, write-back with dirty bit
+//   - L2: 4-way set-associative, pseudo-LRU replacement, write-back with
+//         per-way dirty bit
+//   - Writes are write-no-allocate on a miss: a write only ever updates a
+//     line already resident in L1 or L2; a full write-miss goes straight
+//     to main memory without installing a new line.
+//   - Reads allocate on every level as they travel down: an L2 hit is
+//     promoted into L1; a main-memory fetch is installed into both L2
+//     and L1.
+//   - Evictions only write back if the victim's dirty bit is set; clean
+//     victims are simply dropped.
+//////////////////////////////////////////////////////////////////////////////
+module cache_controller (
+    input  wire                    clk,
+    input  wire                    rst,
 
-/********************************/
-parameter no_of_address_bits=32;    
-parameter no_of_blkoffset_bits=2;
-parameter byte_size=8;         //one block is of 8 bits
-/********************************/
-parameter no_of_l2_ways=4;        //No. of ways in a set... here 4 as it is 4-way set-associative
-parameter no_of_l2_ways_bits=2;     //No. of bits to represent ways, 2 bits are sufficient to represent 4 values
-parameter no_of_l2_blocks=128;      //No. of lines in L2 Cache... each line is a set of 4 blocks here
-parameter no_of_bytes_l2_block=16;   //No. of bytes in a L2 Cache line= 4* bytes in a block = 4*4=16
-parameter l2_block_bit_size=128;     // No. of bits in a L2 Cache line = No.of bytes in a line * byte_size=16*8=128
-parameter no_of_l2_index_bits=7;     // 2^7=128 <= No. of L2 block lines.....So 7 bits are used here to get the no. of line on L2 Cache
-parameter no_of_l2_tag_bits=23;      //No. of tag bits= Address_bits - index_bits- Block_offset = 32 -9 -2 =23
-/********************************/
-parameter no_of_l1_blocks=64;       // No. of lines in L1 Cache... as one line contains 1 block...it is equal to no. of blocks
-parameter no_of_bytes_l1_block=4;   //Each Block has 4 bytes
-parameter l1_block_bit_size=32;     //Size of each line = No. of blocks in a line * No. of bytes in a block * Byte_size = 1*4*8=32
-parameter no_of_l1_index_bits=6;    //as 2^6=64... So 6 index bits are sufficient to locate a line on L1 Cache
-parameter no_of_l1_tag_bits=24;     //No. of tag bits= Address_bits - index_bits- Block_offset = 32 -6 -2 =24
-/********************************/
-parameter no_of_main_memory_blocks=16384; //2^14 //No. of lines in main_memory... as each line contains a single block... No. of lines=No. of blocks here
-parameter main_memory_block_size=32;       //Each line has one block... which in turn has 4 bytes and each byte is of 8 bits=1*4*8=32
-parameter no_of_bytes_main_memory_block=4;     //Each line has one block and each block has 4 bytes
-parameter main_memory_byte_size=65536;          //No. of bytes in main memory=No. of lines* No. of bytes in each line=16384*4=65536
-/*************************************/
-parameter l1_latency=1;         //It represents the delay in fetching a data from L1 Cache...1 here represents that it would be availabe within that clock cycle only
-parameter l2_latency=3;         //It represents the delay in fetching/searching_time in L2 Cache....It will lead to fetching data after passing of 2 clock cycles
-parameter main_memory_latency=10;      //It represents the delay in fetching/searching_times in main_memory.. It would lead to fetching data from main memory after passing of 9 clock cycles
-/*************************************/
+    input  wire                    req_valid,
+    output wire                    req_ready,
+    input  wire [`WORD_WIDTH-1:0]  req_addr,
+    input  wire [`WORD_WIDTH-1:0]  req_wdata,
+    input  wire [3:0]              req_wstrb,   // 4'b0000 = read
 
-input [no_of_address_bits-1:0]address;  
-input clk;
-input [byte_size-1:0]data; 
-input mode;            //mode=0 : Read     mode=1 : Write
-output reg[byte_size-1:0]output_data;
-output reg hit1, hit2;         //hit1=1 shows that the requested memory was found in L1 Cache ,similary hit2 for L2 Cache
-output reg Wait;            //Wait=1 is a signal for the processor...that the cache controller is currently working on some read/write operation and processor needs to wait before the controller accepts next read/write operation
-/********************************/
+    output reg                     resp_valid,
+    output reg  [`WORD_WIDTH-1:0]  resp_rdata,
+    output reg                     hit1,        // resolved in L1
+    output reg                     hit2         // resolved in L2 (L1 miss)
+);
 
-reg [no_of_address_bits-1:0]address_valid;             //For Checking whether there is a stored block at some line in Cache or not
-reg [no_of_address_bits-no_of_blkoffset_bits-1:0]main_memory_blk_id;    //Represents the line number to which the address belongs on main memory
-reg [no_of_l1_tag_bits-1:0]l1_tag;         //The tag for lines on L1 Cache
-reg [no_of_l1_index_bits-1:0]l1_index;         //Represents the index of the line to which the address belongs on L1 Cache
-reg [no_of_l2_tag_bits-1:0]l2_tag;              //The tag for lines on L2 Cache
-reg [no_of_l2_index_bits-1:0]l2_index;          //The index of the line to which the address belongs on L2 Cache
-reg [no_of_blkoffset_bits-1:0]offset;           //Offset gives the index of byte within a block
+    // ------------------------------------------------------------------
+    // state encoding
+    // ------------------------------------------------------------------
+    localparam S_IDLE        = 4'd0,
+               S_L1_LOOKUP   = 4'd1,
+               S_L2_WAIT     = 4'd2,
+               S_L2_LOOKUP   = 4'd3,
+               S_MM_WAIT     = 4'd4,
+               S_MM_ACCESS   = 4'd5,
+               S_MM_DATA     = 4'd6,
+               S_L2_EVICT    = 4'd7,
+               S_L2_FILL     = 4'd8,
+               S_L1_EVICT_WB = 4'd9,
+               S_L1_FILL     = 4'd10,
+               S_MM_WRITE    = 4'd11,
+               S_DONE        = 4'd12;
 
-/********************************/
-integer i;              //integer variables for working in for-loops
-integer j;
-/********************************/
-//the variable given below in various search operation in L1 , L2 and main memory
-//specially when we need to evict some block from L1 or L2 Cache
-//then it needs to be searched in the L2 or in main memory to update its value there
-integer l2_check;
-integer l2_check2;
-integer l2_checka;
-integer l2_check2a;
-integer l2_mm_check;
-integer l2_mm_check2;
-integer l2_mm_iterator;
-integer l2_iterator;
+    reg [3:0] state, next_state;
 
-integer l1_l2_check;
-integer l1_l2_check2;
-integer l1_l2_checka;
-integer l1_l2_check2a;
-integer l1_l2_checkb;
-integer l1_l2_check2b;
-/********************************/
-//Many times we need to evict an block from L1 or L2 Cache..
-//so its value needs to be updated in L2 or main Memory
-//these are the variable used for evicting operations
-//for finding the block present in L1 or L2..its location in L2 or main memory
-reg [no_of_l2_ways_bits-1:0]lru_value;
-reg [no_of_l2_ways_bits-1:0]lru_value_dummy;
+    // ------------------------------------------------------------------
+    // latched request + working registers (pure data, no control timing
+    // subtleties - just captured when the relevant state is current)
+    // ------------------------------------------------------------------
+    reg [`WORD_WIDTH-1:0] req_addr_r;
+    reg [`WORD_WIDTH-1:0] wdata_r;
+    reg [3:0]              wstrb_r;
+    reg                    is_write_r;
 
-reg [no_of_l2_ways_bits-1:0]lru_value2;
-reg [no_of_l2_ways_bits-1:0]lru_value_dummy2;
+    reg [3:0]              delay_cnt;
 
-reg [no_of_l1_tag_bits-1:0]l1_evict_tag;
-reg [no_of_l2_tag_bits-1:0]l1_to_l2_tag;
-reg [no_of_l2_index_bits-1:0]l1_to_l2_index;
+    reg [`WORD_WIDTH-1:0]  mm_rdata_r;
+    reg [`L2_WAY_BITS-1:0] l2_victim_way_r;
+    reg [`L2_TAG_BITS-1:0] l2_evict_tag_r;
+    reg [`WORD_WIDTH-1:0]  l2_evict_data_r;
 
-reg [no_of_l1_tag_bits-1:0]l1_evict_tag2;
-reg [no_of_l2_tag_bits-1:0]l1_to_l2_tag2;
-reg [no_of_l2_index_bits-1:0]l1_to_l2_index2;
+    reg [`L1_TAG_BITS-1:0] l1_evict_tag_r;
+    reg [`WORD_WIDTH-1:0]  l1_evict_data_r;
 
-reg [no_of_l1_tag_bits-1:0]l1_evict_tag3;
-reg [no_of_l2_tag_bits-1:0]l1_to_l2_tag3;
-reg [no_of_l2_index_bits-1:0]l1_to_l2_index3;
+    reg [`WORD_WIDTH-1:0]  l1_fill_data_r;
 
-reg [no_of_l2_tag_bits-1:0]l2_evict_tag;
-/********************************/
-//to store whether the block to be evicted was found in L2 or main memory or not
-reg l1_to_l2_search;
-reg l1_to_l2_search2;
-reg l1_to_l2_search3;
-/********************************/
-//for the delay counters to implement delays in the L2 Cache
-reg [1:0]l2_delay_counter=0;
-reg [3:0]main_memory_delay_counter=0;
-reg dummy_hit;
-reg is_L2_delay=0;
-/********************************/
-//for the delay counters to implement delays in the main memory
-reg [1:0]l2_delay_counter_w=0;
-reg [3:0]main_memory_delay_counter_w=0;
-reg dummy_hit_w=0;
-reg is_L2_delay_w=0;
-/************************************/
-output reg [no_of_address_bits-1:0] stored_address;       //the address stored in cache controller while it is processing ..so that even if the user changes the input..it still has its copy
-reg stored_mode;        //the stored mode (read or write)
-output reg [byte_size-1:0]stored_data;  //the stored data in cache controller...in case the user changes inbetween the process
-reg Ccount=0;   //for initializing the stored values in starting
+    // ------------------------------------------------------------------
+    // address decode (stable for the whole transaction once latched)
+    // ------------------------------------------------------------------
+    wire [`BLK_ID_BITS-1:0]   blk_id   = req_addr_r[`BLK_ID_BITS+1:2];
+    wire [`L1_INDEX_BITS-1:0] l1_index = blk_id[`L1_INDEX_BITS-1:0];
+    wire [`L1_TAG_BITS-1:0]   l1_tag   = blk_id[`BLK_ID_BITS-1:`L1_INDEX_BITS];
+    wire [`L2_INDEX_BITS-1:0] l2_index = blk_id[`L2_INDEX_BITS-1:0];
+    wire [`L2_TAG_BITS-1:0]   l2_tag   = blk_id[`BLK_ID_BITS-1:`L2_INDEX_BITS];
 
-MAIN_MEMORY MAIN_MEMORY();
-L1_CACHE_MEMORY L1_CACHE_MEMORY();
-L2_CACHE_MEMORY L2_CACHE_MEMORY();
+    // reconstructed set/tag in L2 (and address in MM) for a block being
+    // evicted out of L1 - see cache_pkg.vh for the derivation
+    wire [`L2_INDEX_BITS-1:0] l1_evict_l2_index = {l1_evict_tag_r[`L1_TAG_BITS-`L2_TAG_BITS-1:0], l1_index};
+    wire [`L2_TAG_BITS-1:0]   l1_evict_l2_tag   = l1_evict_tag_r[`L1_TAG_BITS-1:`L1_TAG_BITS-`L2_TAG_BITS];
+    wire [`BLK_ID_BITS-1:0]   l1_evict_mm_addr  = {l1_evict_tag_r, l1_index};
 
-always @(posedge clk)
-begin
-    if (Ccount==0)
-        output_data=0;
-    if(Ccount==0 || Wait==0) //if the controller is not in wait state or it is the first operation after reset
-                             //store the input from processor in cache controller
+    wire [`BLK_ID_BITS-1:0]   l2_evict_mm_addr  = {l2_evict_tag_r, l2_index};
+
+    // ------------------------------------------------------------------
+    // l1_cache instance - index fixed to l1_index for the whole
+    // transaction; read is always live, only one write path pulses at a time
+    // ------------------------------------------------------------------
+    wire [`WORD_WIDTH-1:0]  l1_rdata;
+    wire [`L1_TAG_BITS-1:0] l1_rtag;
+    wire                    l1_rvalid, l1_rdirty;
+
+    reg l1_we_data, l1_we_line;
+    reg [`WORD_WIDTH-1:0] l1_line_wdata;
+
+    l1_cache u_l1 (
+        .clk(clk), .rst(rst),
+        .index(l1_index),
+        .rdata(l1_rdata), .rtag(l1_rtag), .rvalid(l1_rvalid), .rdirty(l1_rdirty),
+        .we_data(l1_we_data), .wstrb(wstrb_r), .wdata(wdata_r),
+        .we_line(l1_we_line), .wtag(l1_tag), .line_wdata(l1_line_wdata), .line_dirty_in(1'b0)
+    );
+
+    // ------------------------------------------------------------------
+    // l2_cache instance - index/tag/data/wstrb are all muxed together by
+    // the SAME combinational selector (l2_use_l1evict), so a write and
+    // the index it targets can never drift apart by a clock cycle
+    // ------------------------------------------------------------------
+    reg l2_use_l1evict;   // 1 while this cycle's L2 access is the L1-eviction search/writeback, not the main request
+
+    wire [`L2_INDEX_BITS-1:0] l2_addr_mux  = l2_use_l1evict ? l1_evict_l2_index : l2_index;
+    wire [`L2_TAG_BITS-1:0]   l2_wtag_mux  = l2_use_l1evict ? l1_evict_l2_tag   : l2_tag;
+    wire [3:0]                l2_wstrb_mux = l2_use_l1evict ? 4'b1111           : wstrb_r;
+    wire [`WORD_WIDTH-1:0]    l2_wdata_mux = l2_use_l1evict ? l1_evict_data_r   : wdata_r;
+
+    wire [`L2_WAYS*`WORD_WIDTH-1:0]  l2_rdata_all;
+    wire [`L2_WAYS*`L2_TAG_BITS-1:0] l2_rtag_all;
+    wire [`L2_WAYS-1:0]              l2_rvalid_all;
+    wire [`L2_WAYS-1:0]              l2_rdirty_all;
+    wire [`L2_WAYS*2-1:0]            l2_rlru_all;
+
+    reg [`L2_WAY_BITS-1:0] l2_wway;
+    reg l2_we_data, l2_we_line, l2_we_lru;
+    reg [`WORD_WIDTH-1:0] l2_line_wdata;
+    reg [`L2_WAYS*2-1:0] l2_wlru_all;
+
+    l2_cache u_l2 (
+        .clk(clk), .rst(rst),
+        .index(l2_addr_mux),
+        .rdata_all(l2_rdata_all), .rtag_all(l2_rtag_all),
+        .rvalid_all(l2_rvalid_all), .rdirty_all(l2_rdirty_all), .rlru_all(l2_rlru_all),
+        .wway(l2_wway),
+        .we_data(l2_we_data), .wstrb(l2_wstrb_mux), .wdata(l2_wdata_mux),
+        .we_line(l2_we_line), .wtag(l2_wtag_mux),
+        .line_wdata(l2_line_wdata), .line_dirty_in(1'b0),
+        .we_lru(l2_we_lru), .wlru_all(l2_wlru_all)
+    );
+
+    // per-way slice helpers (indexed part-select, variable base - standard,
+    // synthesizable pattern for muxing a flattened bus by a runtime index)
+    function [`L2_TAG_BITS-1:0] l2_tag_of;
+        input [1:0] way;
+        input [`L2_WAYS*`L2_TAG_BITS-1:0] bus;
+        l2_tag_of = bus[(way+1)*`L2_TAG_BITS-1 -: `L2_TAG_BITS];
+    endfunction
+
+    function [`WORD_WIDTH-1:0] l2_data_of;
+        input [1:0] way;
+        input [`L2_WAYS*`WORD_WIDTH-1:0] bus;
+        l2_data_of = bus[(way+1)*`WORD_WIDTH-1 -: `WORD_WIDTH];
+    endfunction
+
+    function [1:0] l2_lru_of;
+        input [1:0] way;
+        input [`L2_WAYS*2-1:0] bus;
+        l2_lru_of = bus[(way+1)*2-1 -: 2];
+    endfunction
+
+    // promote `hit_way` to MRU, decrementing every way whose LRU value
+    // was strictly greater (standard pseudo-LRU stack update)
+    function [`L2_WAYS*2-1:0] lru_promote;
+        input [`L2_WAYS*2-1:0] cur;
+        input [1:0] hit_way;
+        reg [1:0] v [0:3];
+        reg [1:0] hit_val;
+        integer k;
         begin
-            stored_address=address;
-            Ccount=1;
-            stored_mode=mode;
-            stored_data=data;
-        end
-    main_memory_blk_id=(stored_address>>no_of_blkoffset_bits)%MAIN_MEMORY.no_of_main_memory_blocks; //the index of address in main memory
-    l2_index=(main_memory_blk_id)%L2_CACHE_MEMORY.no_of_l2_blocks;  //the index of the address in L2 Cache
-    l2_tag=main_memory_blk_id>>no_of_l2_index_bits;     //The tag for the address in L2 Cache
-    l1_index=(main_memory_blk_id)%L1_CACHE_MEMORY.no_of_l1_blocks;  //The index in L1 Cache for the address
-    l1_tag=main_memory_blk_id>>no_of_l1_index_bits;//The tag for the address in L1 Cache
-    offset=stored_address%MAIN_MEMORY.no_of_bytes_main_memory_block;  //the offset...to extract the particular byte from a block
-    if (stored_mode==0)
-    begin
-        $display("Check Started");
-        /************************************************************************************************************************************/
-        if (L1_CACHE_MEMORY.l1_valid[l1_index]&&L1_CACHE_MEMORY.l1_tag_array[l1_index]==l1_tag) //if the tag matches and the valid is true for the location in L1 Cache..then the address is found in L1 Cache
-        begin
-            //$display("Found in L1 Cache");
-            output_data=L1_CACHE_MEMORY.l1_cache_memory[l1_index][((offset+1)*byte_size-1)-:byte_size]; //extract the exact byte from the L1 Cache
-            hit1=1;     //found in L1 Cache
-            hit2=0;        //not found in L1 Cache
-            Wait=0;         //as found in L1, the controller is ready for next instruction
-        end
-        /************************************************************************************************************************************/
-        else
-        begin
-            /************************************************************************************************************************************/
-            $display("Not Found in L1 Cache");  //if not found in L1 Cache 
-            hit1=0;     //not found in L1 Cache
-            if (l2_delay_counter<l2_latency && is_L2_delay==0)      //a counter to implement the delay for searching in L2 Cache
-            begin
-                hit2=0;     //not found in L2 Cache till now
-                hit1=0;     //not found in L1 Cache
-                l2_delay_counter = l2_delay_counter+1;          //increment the counter variable in every cycle
-                Wait=1;     //the controller is still searching the address.. so can't accept new request from processor at present
+            for (k = 0; k < 4; k = k + 1) v[k] = cur[(k+1)*2-1 -: 2];
+            hit_val = v[hit_way];
+            for (k = 0; k < 4; k = k + 1) begin
+                if (k[1:0] == hit_way) v[k] = 2'd3;
+                else if (v[k] > hit_val) v[k] = v[k] - 2'd1;
             end
-            else
-            begin //Actual searching in L2 Cache begins
-                l2_delay_counter=0;     //resetting the counter for delay in next input
-                hit1=0;     //not found in L1 Cache
-                hit2=1;     //Let's assume it would be found in L2 Cache
-                Wait=0;     //Assuming it would be found in L2 Cache, so wait would be zero
-                dummy_hit=0;
-                for (l2_check=0;l2_check<no_of_l2_ways;l2_check=l2_check+1)     //now checking for every block in the set in L2 Cache required index line
-                begin
-                    if (L2_CACHE_MEMORY.l2_valid[l2_index][l2_check]&&L2_CACHE_MEMORY.l2_tag_array[l2_index][((l2_check+1)*no_of_l2_tag_bits-1)-:no_of_l2_tag_bits]==l2_tag) //if the tag matches and is valid
-                    begin
-                        dummy_hit=1;        //We have successfully found the address (in L2 Cache)
-                        l2_check2=l2_check;      //We store the block in which the address was found
-                    end
-                end
-                if (dummy_hit==1) $display("Found in L2 Cache");    //for own reference while debugging the verilog
-                else $display("Not Found in L2 Cache");
-                if (dummy_hit==1)       //if the address was found in L2 Cache
-                begin
-                    lru_value2=L2_CACHE_MEMORY.lru[l2_index][((l2_check2+1)*no_of_l2_ways_bits-1)-:no_of_l2_ways_bits]; //lRU value for the block where the address was found
-                    for (l2_iterator=0;l2_iterator<no_of_l2_ways;l2_iterator=l2_iterator+1)     //Updating the LRU values of all the blocks by iterating over all the 4 blocks in the L2 Line
-                    begin
-                       lru_value_dummy2=L2_CACHE_MEMORY.lru[l2_index][((l2_iterator+1)*no_of_l2_ways_bits-1)-:no_of_l2_ways_bits]; //get current LRU value of the current block in the loop (iteration)
-                       if (lru_value_dummy2>lru_value2)     //We only need to update the LRU values of the blocks with LRU values strictly greater than the new LRU value of found block... That is we update the LRU values of all 3 blocks except the found block whose LRU we update at last
-                       begin
-                           L2_CACHE_MEMORY.lru[l2_index][((l2_iterator+1)*no_of_l2_ways_bits-1)-:no_of_l2_ways_bits]=lru_value_dummy2-1; //we reduce the LRU value of the block here by 1
-                       end
-                    end
-                    L2_CACHE_MEMORY.lru[l2_index][((l2_check2+1)*no_of_l2_ways_bits-1)-:no_of_l2_ways_bits]=no_of_l2_ways-1; //the found block was most recent ...so its LRU must be higest here... that is no. of ways -1 =3
-                    
-                    //transferring the L2 Block to L1 Cache begins here
-                    if (L1_CACHE_MEMORY.l1_valid[l1_index]==0)      //if the particular mapped block in L1 Cache in empty/not valid
-                    begin
-                        L1_CACHE_MEMORY.l1_cache_memory[l1_index]=L2_CACHE_MEMORY.l2_cache_memory[l2_index][((l2_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size];     //copy the data to L1
-                        L1_CACHE_MEMORY.l1_valid[l1_index]=1;       //set valid for the respective block to 1
-                        L1_CACHE_MEMORY.l1_tag_array[l1_index]=l1_tag;  //update the tag for the block
-                        output_data=L1_CACHE_MEMORY.l1_cache_memory[l1_index][((offset+1)*byte_size-1)-:byte_size]; //taking the data as the output data
-                        dummy_hit=1;        //as the address was found in L2 and now transferred to L1... the address was found
-                    end
-                    else
-                    begin       //if there is already a valid block present at the particular line
-                        l1_evict_tag2=L1_CACHE_MEMORY.l1_tag_array[l1_index];   //the tag of the block in L2 to be evicted
-                        l1_to_l2_tag2=l1_evict_tag2>>(no_of_l1_tag_bits-no_of_l2_tag_bits);     //retriving the tag of the block in L2 who has to be evicted in L1
-                        l1_to_l2_index2={l1_evict_tag2[no_of_l1_tag_bits-no_of_l2_tag_bits-1:0],l1_index}; //retriving the index of the block in L2 who has to be evicted in L1
-                        l1_to_l2_search2=0;             //now after knowing the line, we need to get the block in which it is present among the 4 ways in the L2 cache
-                        for (l1_l2_checka=0;l1_l2_checka<no_of_l2_ways;l1_l2_checka=l1_l2_checka+1)
-                        begin
-                            if (L2_CACHE_MEMORY.l2_valid[l1_to_l2_index2][l1_l2_checka]&&L2_CACHE_MEMORY.l2_tag_array[l1_to_l2_index2][((l1_l2_checka+1)*no_of_l2_tag_bits-1)-:no_of_l2_tag_bits]==l1_to_l2_tag2)  //checking in the loop whether the current block is the block that is searched
-                            begin
-                                l1_to_l2_search2=1;         //indicating that it was found in L2
-                                l1_l2_check2a=l1_l2_checka;    //storing the index of the block in set in which it is present
-                            end
-                        end
-                        if (l1_to_l2_search2==1)   //now after getting the whole location in L2 cache for the block that is to be evicted, we now evict the block from L1 , update the data in L2 and place the new block in L1 replacing it
-                        begin
-                            //$display("found l1 eviction in l2");
-                            L2_CACHE_MEMORY.l2_cache_memory[l1_to_l2_index2][((l1_l2_check2a+1)*l1_block_bit_size-1)-:l1_block_bit_size]=L1_CACHE_MEMORY.l1_cache_memory[l1_index];
-                            //$display("%B",L2_CACHE_MEMORY.l2_cache_memory[l1_to_l2_index][((l1_l2_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size]);
-                            L1_CACHE_MEMORY.l1_cache_memory[l1_index]=L2_CACHE_MEMORY.l2_cache_memory[l2_index][((l2_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size];
-                            //$display("%B",L1_CACHE_MEMORY.l1_cache_memory[l1_index]);
-                            L1_CACHE_MEMORY.l1_valid[l1_index]=1;
-                            L1_CACHE_MEMORY.l1_tag_array[l1_index]=l1_tag;
-                            //$display("%B",L1_CACHE_MEMORY.l1_tag_array[l1_index]);
-                            output_data=L1_CACHE_MEMORY.l1_cache_memory[l1_index][((offset+1)*byte_size-1)-:byte_size];
-                            dummy_hit=1;
-                        end
-                        else
-                        begin //if not found in L2, then definitely, it would be in main Memory, so we update the data in main memory and then place the found block in L1 Cache
-                            MAIN_MEMORY.main_memory[{l1_evict_tag2,l1_index}]=L1_CACHE_MEMORY.l1_cache_memory[l1_index];
-                            L1_CACHE_MEMORY.l1_cache_memory[l1_index]=L2_CACHE_MEMORY.l2_cache_memory[l2_index][((l2_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size];
-                            //$display("%B",L1_CACHE_MEMORY.l1_cache_memory[l1_index]);
-                            L1_CACHE_MEMORY.l1_valid[l1_index]=1;
-                            L1_CACHE_MEMORY.l1_tag_array[l1_index]=l1_tag;
-                            //$display("%B",L1_CACHE_MEMORY.l1_tag_array[l1_index]);
-                            output_data=L1_CACHE_MEMORY.l1_cache_memory[l1_index][((offset+1)*byte_size-1)-:byte_size];
-                            dummy_hit=1;
-                        end
-                    end
-                end
-                /************************************************************************************************************************************/
-                else
-                //if the address was not found in L1 cache and L2 Cache as well, we now search in Main Memory
-                begin 
-                    hit1=0;         //was Not found in L1
-                    hit2=0;     //was not found in L2
-                    Wait=1;         //still searching , so wait
-                    /************************************************************************************************************************************/
-                    $display("Not found in L2 cache, Extracting from main memory");
-                    
-                    if (main_memory_delay_counter<main_memory_latency) //a counter loop to show the delays in searching in main memory
-                    begin
-                        hit1=0; //not found in L1 Cache
-                        hit2=0;     //not found in L2 Cache
-                        main_memory_delay_counter = main_memory_delay_counter+1; //increase the counter variable each cycle
-                        Wait=1;     //still not found, searching so a wait signal to processor
-                        is_L2_delay=1;
-                    end
-                    else
-                    begin //actual search in Main memory begins here
-                        main_memory_delay_counter=0;  //resetting the counter for delay in the next inputs 
-                        is_L2_delay=0;
-                        hit1=0;
-                        hit2=0;
-                        Wait=0;     //the block would definately be found here
-                        l2_delay_counter=0;
-                        //now we start the process of promoting the address to L2 Cache
-                        for (l2_mm_check=0;l2_mm_check<no_of_l2_ways;l2_mm_check=l2_mm_check+1)   //searching for the least recently used block in L2 , so this block in main memory can replace that block in L2
-                        begin
-                            if (L2_CACHE_MEMORY.lru[l2_index][((l2_mm_check+1)*no_of_l2_ways_bits-1)-:no_of_l2_ways_bits]==0)
-                            begin
-                                l2_mm_check2=l2_mm_check;
-                            end
-                        end
-                        $display("%D",l2_mm_check2);
-                        lru_value=L2_CACHE_MEMORY.lru[l2_index][((l2_mm_check2+1)*no_of_l2_ways_bits-1)-:no_of_l2_ways_bits];    //getting the lru values of the particular line in L2 Cache
-                        //$display("%D",lru_value);
-                        //here we made a copy of the lru values and start updating these to replace the original lru values when complete
-                        for (l2_mm_iterator=0;l2_mm_iterator<no_of_l2_ways;l2_mm_iterator=l2_mm_iterator+1)
-                        begin
-                            //$display("Initial");
-                            lru_value_dummy=L2_CACHE_MEMORY.lru[l2_index][((l2_mm_iterator+1)*no_of_l2_ways_bits-1)-:no_of_l2_ways_bits];
-                            //$display("%D",lru_value_dummy);
-                           if ((L2_CACHE_MEMORY.lru[l2_index][((l2_mm_iterator+1)*no_of_l2_ways_bits-1)-:no_of_l2_ways_bits])>lru_value)   
-                           begin
-                               //$display("bigger");
-                               L2_CACHE_MEMORY.lru[l2_index][((l2_mm_iterator+1)*no_of_l2_ways_bits-1)-:no_of_l2_ways_bits]=lru_value_dummy-1;         //here we update the lru values
-                               lru_value_dummy=L2_CACHE_MEMORY.lru[l2_index][((l2_mm_iterator+1)*no_of_l2_ways_bits-1)-:no_of_l2_ways_bits];
-                               //$display("%D",lru_value_dummy);
-                           end
-                        end
-                        L2_CACHE_MEMORY.lru[l2_index][((l2_mm_check2+1)*no_of_l2_ways_bits-1)-:no_of_l2_ways_bits]=(no_of_l2_ways-1);       //now we place the block and make its lru value the highest .. indicating that its the most recent used
-                        $display("%D",L2_CACHE_MEMORY.lru[l2_index]);
-                        
-                        //if the block to be replaced in L2 was empty/not valid
-                        if (L2_CACHE_MEMORY.l2_valid[l2_index][l2_mm_check2]==0)       
-                        begin
-                            //here we just copy the data to L2 without any need to evict any block in L2 cache
-                            $display("Initially not present in l2");
-                            L2_CACHE_MEMORY.l2_cache_memory[l2_index][((l2_mm_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size]=MAIN_MEMORY.main_memory[main_memory_blk_id];
-                            $display("%B",L2_CACHE_MEMORY.l2_cache_memory[l2_index][((l2_mm_check2+1)*byte_size-1)-:byte_size]);
-                            L2_CACHE_MEMORY.l2_valid[l2_index][l2_mm_check2]=1;
-                            $display("%B",L2_CACHE_MEMORY.l2_valid[l2_index][l2_mm_check2]);
-                            L2_CACHE_MEMORY.l2_tag_array[l2_index][((l2_mm_check2+1)*no_of_l2_tag_bits-1)-:no_of_l2_tag_bits]=l2_tag;
-                            $display("%B",L2_CACHE_MEMORY.l2_tag_array[l2_index][((l2_mm_check2+1)*no_of_l2_tag_bits-1)-:no_of_l2_tag_bits]);
-                            ///
-                            //now we have started to procedure to place it in L1 Cache as well
-                            if (L1_CACHE_MEMORY.l1_valid[l1_index]==0)
-                            begin
-                                $display("Initially not present in l1");
-                                L1_CACHE_MEMORY.l1_cache_memory[l1_index]=MAIN_MEMORY.main_memory[main_memory_blk_id];
-                                $display("%B",L1_CACHE_MEMORY.l1_cache_memory[l1_index]);
-                                L1_CACHE_MEMORY.l1_valid[l1_index]=1;
-                                $display("%B",L1_CACHE_MEMORY.l1_valid[l1_index]);
-                                L1_CACHE_MEMORY.l1_tag_array[l1_index]=l1_tag;
-                                $display("%B",L1_CACHE_MEMORY.l1_tag_array[l1_index]);
-                                output_data=L1_CACHE_MEMORY.l1_cache_memory[l1_index][((offset+1)*byte_size-1)-:byte_size];
-                                dummy_hit=0; 
-                            end
-                            else
-                            begin
-                                //if there is a block in L1 Cache already at the particular line, then it needs to be evicted
-                                //and the new block needs to be placed there
-                                //just like the same procedure we have followed if it was found in L2 Cache instead of main memory
-                                $display("Initially present in l1");
-                                l1_evict_tag=L1_CACHE_MEMORY.l1_tag_array[l1_index];
-                                $display("%B",l1_evict_tag);
-                                l1_to_l2_tag=l1_evict_tag>>(no_of_l1_tag_bits-no_of_l2_tag_bits);
-                                $display("%B",l1_to_l2_tag);
-                                l1_to_l2_index={l1_evict_tag[no_of_l1_tag_bits-no_of_l2_tag_bits-1:0],l1_index};
-                                $display("%B",l1_to_l2_index);
-                                l1_to_l2_search=0;
-                                for (l1_l2_check=0;l1_l2_check<no_of_l2_ways;l1_l2_check=l1_l2_check+1)
-                                begin
-                                    if (L2_CACHE_MEMORY.l2_valid[l1_to_l2_index][l1_l2_check]&&L2_CACHE_MEMORY.l2_tag_array[l1_to_l2_index][((l1_l2_check+1)*no_of_l2_tag_bits-1)-:no_of_l2_tag_bits]==l1_to_l2_tag)
-                                    begin
-                                        l1_to_l2_search=1;
-                                        l1_l2_check2=l1_l2_check;
-                                    end
-                                end
-                                //this is the same procedure as mentioned when the memory in L1 was to be replaced when the block was found in L2 Cache
-                                //when the block to evicted was found in L2 Cache....so we need to update its value in L2 Cache location
-                                if (l1_to_l2_search==1)
-                                begin
-                                    $display("found l1 eviction in l2");
-                                    L2_CACHE_MEMORY.l2_cache_memory[l1_to_l2_index][((l1_l2_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size]=L1_CACHE_MEMORY.l1_cache_memory[l1_index];
-                                    $display("%B",L2_CACHE_MEMORY.l2_cache_memory[l1_to_l2_index][((l1_l2_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size]);
-                                    L1_CACHE_MEMORY.l1_cache_memory[l1_index]=L2_CACHE_MEMORY.l2_cache_memory[l2_index][((l2_mm_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size];
-                                    $display("%B",L1_CACHE_MEMORY.l1_cache_memory[l1_index]);
-                                    L1_CACHE_MEMORY.l1_valid[l1_index]=1;
-                                    L1_CACHE_MEMORY.l1_tag_array[l1_index]=l1_tag;
-                                    $display("%B",L1_CACHE_MEMORY.l1_tag_array[l1_index]);
-                                    output_data=L1_CACHE_MEMORY.l1_cache_memory[l1_index][((offset+1)*byte_size-1)-:byte_size];
-                                    dummy_hit=0;
-                                end
-                                else
-                                //when the block to be evicted is not present in L2 Cache
-                                //now the data stored in the main memory needs to be updated
-                                begin
-                                    MAIN_MEMORY.main_memory[{l1_evict_tag,l1_index}]=L1_CACHE_MEMORY.l1_cache_memory[l1_index];
-                                    L1_CACHE_MEMORY.l1_cache_memory[l1_index]=L2_CACHE_MEMORY.l2_cache_memory[l2_index][((l2_mm_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size];
-                                    $display("%B",L1_CACHE_MEMORY.l1_cache_memory[l1_index]);
-                                    L1_CACHE_MEMORY.l1_valid[l1_index]=1;
-                                    L1_CACHE_MEMORY.l1_tag_array[l1_index]=l1_tag;
-                                    $display("%B",L1_CACHE_MEMORY.l1_tag_array[l1_index]);
-                                    output_data=L1_CACHE_MEMORY.l1_cache_memory[l1_index][((offset+1)*byte_size-1)-:byte_size];
-                                    dummy_hit=0;
-                                end
-                            end
-                        end
-                        /************************************************************************************************************************************/
-                        else
-                        begin
-                            /************************************************************************************************************************************/
-                            $display("Initially valid data present in l2");
-                            //if instead of invalid/empty location in L2, there was some block placed in L2 Cache
-                            //here we evict the block in L2 and update its data in main memory
-                            l2_evict_tag=L2_CACHE_MEMORY.l2_tag_array[l2_index][((l2_mm_check2+1)*no_of_l2_tag_bits-1)-:no_of_l2_tag_bits];
-                            MAIN_MEMORY.main_memory[{l2_evict_tag,l2_index}]=L2_CACHE_MEMORY.l2_cache_memory[l2_index][((l2_mm_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size];
-                            
-                            L2_CACHE_MEMORY.l2_cache_memory[l2_index][((l2_mm_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size]=MAIN_MEMORY.main_memory[main_memory_blk_id];
-                            L2_CACHE_MEMORY.l2_valid[l2_index][l2_mm_check2]=1;
-                            L2_CACHE_MEMORY.l2_tag_array[l2_index][((l2_mm_check2+1)*no_of_l2_tag_bits-1)-:no_of_l2_tag_bits]=l2_tag;
-                            /************************************************************************************************************************************/
-                            
-                            //now we are promoting the address to L1 Cache
-                            //its the same method as discussed before for promotinng an address in L2 to L1 
+            lru_promote = {v[3], v[2], v[1], v[0]};
+        end
+    endfunction
 
-                            if (L1_CACHE_MEMORY.l1_valid[l1_index]==0) //if the line at the L1 Cache was empty
-                            begin
-                                L1_CACHE_MEMORY.l1_cache_memory[l1_index]=L2_CACHE_MEMORY.l2_cache_memory[l2_index][((l2_mm_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size];
-                                L1_CACHE_MEMORY.l1_valid[l1_index]=1;
-                                L1_CACHE_MEMORY.l1_tag_array[l1_index]=l1_tag;
-                                output_data=L1_CACHE_MEMORY.l1_cache_memory[l1_index][((offset+1)*byte_size-1)-:byte_size];
-                                dummy_hit=0;
-                            end
-                            else
-                            begin
-                                //else there was some block placed in L1 Cache which needs to be evicted
-                                //its the same method as mentioned before when the block in L1 is to be evicted to replace it with the found block
-                                l1_evict_tag3=L1_CACHE_MEMORY.l1_tag_array[l1_index];
-                                //here we are searching for the address of the block in L2 which has to be evicted from L1 Cache
-                                //so that it can be update the data of the block to be evicted in L2 Cache
-                                l1_to_l2_tag3=l1_evict_tag3>>(no_of_l1_tag_bits-no_of_l2_tag_bits);
-                                l1_to_l2_index3={l1_evict_tag3[no_of_l1_tag_bits-no_of_l2_tag_bits-1:0],l1_index};
-                                l1_to_l2_search3=0;
-                                for (l1_l2_checkb=0;l1_l2_checkb<no_of_l2_ways;l1_l2_checkb=l1_l2_checkb+1)  
-                                begin
-                                    if (L2_CACHE_MEMORY.l2_valid[l1_to_l2_index3][l1_l2_checkb]&&L2_CACHE_MEMORY.l2_tag_array[l1_to_l2_index3][((l1_l2_checkb+1)*no_of_l2_tag_bits-1)-:no_of_l2_tag_bits]==l1_to_l2_tag3)
-                                    begin
-                                        l1_to_l2_search3=1;
-                                        l1_l2_check2b=l1_l2_checkb;
-                                    end
-                                end
-                                //when we have found the block's location in  L2 Cache.. we update the data at block in L2 Cache
-                                if (l1_to_l2_search3==1)
-                                begin
-                                    //$display("found l1 eviction in l2");
-                                    L2_CACHE_MEMORY.l2_cache_memory[l1_to_l2_index3][((l1_l2_check2b+1)*l1_block_bit_size-1)-:l1_block_bit_size]=L1_CACHE_MEMORY.l1_cache_memory[l1_index];
-                                    //$display("%B",L2_CACHE_MEMORY.l2_cache_memory[l1_to_l2_index][((l1_l2_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size]);
-                                    L1_CACHE_MEMORY.l1_cache_memory[l1_index]=L2_CACHE_MEMORY.l2_cache_memory[l2_index][((l2_mm_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size];
-                                    //$display("%B",L1_CACHE_MEMORY.l1_cache_memory[l1_index]);
-                                    L1_CACHE_MEMORY.l1_valid[l1_index]=1;
-                                    L1_CACHE_MEMORY.l1_tag_array[l1_index]=l1_tag;
-                                    //$display("%B",L1_CACHE_MEMORY.l1_tag_array[l1_index]);
-                                    output_data=L1_CACHE_MEMORY.l1_cache_memory[l1_index][((offset+1)*byte_size-1)-:byte_size];
-                                    dummy_hit=0;
-                                end
-                                else
-                                begin
-                                    //in case when the data at main memory needs to be updated...
-                                    //it is when the block was not found in L2 Cache and now we must update its value in Main Memory
-                                    MAIN_MEMORY.main_memory[{l1_evict_tag3,l1_index}]=L1_CACHE_MEMORY.l1_cache_memory[l1_index];
-                                    L1_CACHE_MEMORY.l1_cache_memory[l1_index]=L2_CACHE_MEMORY.l2_cache_memory[l2_index][((l2_mm_check2+1)*l1_block_bit_size-1)-:l1_block_bit_size];
-                                    //$display("%B",L1_CACHE_MEMORY.l1_cache_memory[l1_index]);
-                                    L1_CACHE_MEMORY.l1_valid[l1_index]=1;
-                                    L1_CACHE_MEMORY.l1_tag_array[l1_index]=l1_tag;
-                                    //$display("%B",L1_CACHE_MEMORY.l1_tag_array[l1_index]);
-                                    output_data=L1_CACHE_MEMORY.l1_cache_memory[l1_index][((offset+1)*byte_size-1)-:byte_size];
-                                    dummy_hit=0;
-                                end
-                            end
-                        end
-                    end    
-                end //a.
-            end //c.      
+    // ------------------------------------------------------------------
+    // main_memory instance
+    // ------------------------------------------------------------------
+    reg  [`BLK_ID_BITS-1:0] mm_addr;
+    reg                     mm_re, mm_we;
+    reg  [`WORD_WIDTH-1:0]  mm_wdata_mux;
+    wire [`WORD_WIDTH-1:0]  mm_rdata;
+
+    main_memory u_mm (
+        .clk(clk), .rst(rst),
+        .addr(mm_addr), .re(mm_re), .rdata(mm_rdata),
+        .we(mm_we), .wdata(mm_wdata_mux)
+    );
+
+    // ------------------------------------------------------------------
+    // combinational L2 hit / victim / L1-evict search helpers
+    // ------------------------------------------------------------------
+    reg l2_hit_c;
+    reg [1:0] l2_hit_way_c;
+    integer hw;
+    always @(*) begin
+        l2_hit_c = 1'b0;
+        l2_hit_way_c = 2'd0;
+        for (hw = 0; hw < 4; hw = hw + 1)
+            if (l2_rvalid_all[hw] && (l2_tag_of(hw[1:0], l2_rtag_all) == l2_tag)) begin
+                l2_hit_c = 1'b1;
+                l2_hit_way_c = hw[1:0];
+            end
+    end
+
+    reg [1:0] l2_victim_c;
+    integer vw;
+    always @(*) begin
+        l2_victim_c = 2'd0;
+        for (vw = 0; vw < 4; vw = vw + 1)
+            if (l2_lru_of(vw[1:0], l2_rlru_all) == 2'd0)
+                l2_victim_c = vw[1:0];
+    end
+
+    // valid only while l2_use_l1evict is asserted (S_L1_EVICT_WB)
+    reg l1_evict_found_c;
+    reg [1:0] l1_evict_way_c;
+    integer ew;
+    always @(*) begin
+        l1_evict_found_c = 1'b0;
+        l1_evict_way_c = 2'd0;
+        for (ew = 0; ew < 4; ew = ew + 1)
+            if (l2_rvalid_all[ew] && (l2_tag_of(ew[1:0], l2_rtag_all) == l1_evict_l2_tag)) begin
+                l1_evict_found_c = 1'b1;
+                l1_evict_way_c = ew[1:0];
+            end
+    end
+
+    // does the current L1-install step (from an L2 hit-read, or an L2
+    // fill after an MM fetch) need to evict a dirty L1 line first?
+    wire l1_installing_from_l2hit = (state == S_L2_LOOKUP) && l2_hit_c && !is_write_r;
+    wire l1_installing_from_fill  = (state == S_L2_FILL);
+    wire l1_evict_trigger_c       = (l1_installing_from_l2hit || l1_installing_from_fill) && l1_rvalid && l1_rdirty;
+
+    assign req_ready = (state == S_IDLE);
+
+    // ------------------------------------------------------------------
+    // combinational next-state + output logic
+    // ------------------------------------------------------------------
+    reg resp_valid_c;
+    reg [`WORD_WIDTH-1:0] resp_rdata_c;
+    reg hit1_c, hit2_c;
+
+    always @(*) begin
+        // defaults
+        next_state    = state;
+        l1_we_data    = 1'b0;
+        l1_we_line    = 1'b0;
+        l1_line_wdata = l1_fill_data_r;
+        l2_we_data    = 1'b0;
+        l2_we_line    = 1'b0;
+        l2_we_lru     = 1'b0;
+        l2_wway       = 2'd0;
+        l2_line_wdata = mm_rdata_r;
+        l2_wlru_all   = l2_rlru_all;
+        l2_use_l1evict = 1'b0;
+        mm_re         = 1'b0;
+        mm_we         = 1'b0;
+        mm_addr       = blk_id;
+        mm_wdata_mux  = wdata_r;
+        resp_valid_c  = 1'b0;
+        resp_rdata_c  = resp_rdata;
+        hit1_c        = hit1;
+        hit2_c        = hit2;
+
+        case (state)
+        // ----------------------------------------------------------------
+        S_IDLE: begin
+            if (req_valid)
+                next_state = S_L1_LOOKUP;
+        end
+
+        // L1 lookup result is available combinationally: index has been
+        // l1_index since the request was latched, so it's ready now.
+        S_L1_LOOKUP: begin
+            if (l1_rvalid && (l1_rtag == l1_tag)) begin
+                hit1_c = 1'b1;
+                hit2_c = 1'b0;
+                if (is_write_r) begin
+                    l1_we_data   = 1'b1;
+                    resp_rdata_c = 32'd0;
+                end else begin
+                    resp_rdata_c = l1_rdata;
+                end
+                next_state = S_DONE;
+            end else begin
+                hit1_c     = 1'b0;
+                next_state = S_L2_WAIT;
+            end
+        end
+
+        S_L2_WAIT: begin
+            if (delay_cnt == `L2_LATENCY - 1)
+                next_state = S_L2_LOOKUP;
+        end
+
+        S_L2_LOOKUP: begin
+            if (l2_hit_c) begin
+                hit2_c      = 1'b1;
+                l2_wway     = l2_hit_way_c;
+                l2_we_lru   = 1'b1;
+                l2_wlru_all = lru_promote(l2_rlru_all, l2_hit_way_c);
+
+                if (is_write_r) begin
+                    l2_we_data   = 1'b1;
+                    resp_rdata_c = 32'd0;
+                    next_state   = S_DONE;
+                end else begin
+                    resp_rdata_c = l2_data_of(l2_hit_way_c, l2_rdata_all);
+                    next_state   = l1_evict_trigger_c ? S_L1_EVICT_WB : S_L1_FILL;
+                end
+            end else begin
+                hit2_c     = 1'b0;
+                next_state = S_MM_WAIT;
+            end
+        end
+
+        S_MM_WAIT: begin
+            if (delay_cnt == `MM_LATENCY - 1) begin
+                mm_addr = blk_id;
+                if (is_write_r) begin
+                    mm_we        = 1'b1;
+                    mm_wdata_mux = wdata_r;
+                    next_state   = S_MM_WRITE;
+                end else begin
+                    mm_re      = 1'b1;
+                    next_state = S_MM_ACCESS;
+                end
+            end
+        end
+
+        S_MM_WRITE: begin
+            resp_rdata_c = 32'd0;
+            next_state   = S_DONE;
+        end
+
+        // main_memory read is synchronous - data lands the cycle after re
+        S_MM_ACCESS: begin
+            next_state = S_MM_DATA;
+        end
+
+        S_MM_DATA: begin
+            if (l2_rvalid_all[l2_victim_c] && l2_rdirty_all[l2_victim_c])
+                next_state = S_L2_EVICT;
+            else
+                next_state = S_L2_FILL;
+        end
+
+        S_L2_EVICT: begin
+            mm_addr      = l2_evict_mm_addr;
+            mm_we        = 1'b1;
+            mm_wdata_mux = l2_evict_data_r;
+            next_state   = S_L2_FILL;
+        end
+
+        S_L2_FILL: begin
+            l2_wway       = l2_victim_way_r;
+            l2_we_line    = 1'b1;
+            l2_line_wdata = mm_rdata_r;
+            l2_we_lru     = 1'b1;
+            l2_wlru_all   = lru_promote(l2_rlru_all, l2_victim_way_r);
+
+            resp_rdata_c = mm_rdata_r;
+            next_state   = l1_evict_trigger_c ? S_L1_EVICT_WB : S_L1_FILL;
+        end
+
+        // l2_use_l1evict redirects the L2 port to the reconstructed evict
+        // set/tag THIS cycle, for both the search and the writeback - no
+        // register-timing mismatch, everything here is comb-this-cycle
+        S_L1_EVICT_WB: begin
+            l2_use_l1evict = 1'b1;
+            if (l1_evict_found_c) begin
+                l2_wway    = l1_evict_way_c;
+                l2_we_data = 1'b1;
+            end else begin
+                mm_addr      = l1_evict_mm_addr;
+                mm_we        = 1'b1;
+                mm_wdata_mux = l1_evict_data_r;
+            end
+            next_state = S_L1_FILL;
+        end
+
+        S_L1_FILL: begin
+            l1_we_line    = 1'b1;
+            l1_line_wdata = l1_fill_data_r;
+            next_state    = S_DONE;
+        end
+
+        S_DONE: begin
+            resp_valid_c = 1'b1;
+            next_state   = S_IDLE;
+        end
+
+        default: next_state = S_IDLE;
+        endcase
+    end
+
+    // ------------------------------------------------------------------
+    // sequential: state + data-capture registers only
+    // ------------------------------------------------------------------
+    always @(posedge clk) begin
+        if (rst) begin
+            state      <= S_IDLE;
+            resp_valid <= 1'b0;
+            resp_rdata <= {`WORD_WIDTH{1'b0}};
+            hit1       <= 1'b0;
+            hit2       <= 1'b0;
+            delay_cnt  <= 4'd0;
+        end else begin
+            state      <= next_state;
+            resp_valid <= resp_valid_c;
+            resp_rdata <= resp_rdata_c;
+            hit1       <= hit1_c;
+            hit2       <= hit2_c;
+
+            // latch the incoming request
+            if (state == S_IDLE && req_valid) begin
+                req_addr_r <= req_addr;
+                wdata_r    <= req_wdata;
+                wstrb_r    <= req_wstrb;
+                is_write_r <= (req_wstrb != 4'b0000);
+            end
+
+            // delay counters: reset whenever leaving IDLE into a wait
+            // stage, or when a wait stage's own count expires
+            if ((state == S_L1_LOOKUP) || (state == S_L2_LOOKUP))
+                delay_cnt <= 4'd0;
+            else if (state == S_L2_WAIT)
+                delay_cnt <= (delay_cnt == `L2_LATENCY - 1) ? 4'd0 : delay_cnt + 4'd1;
+            else if (state == S_MM_WAIT)
+                delay_cnt <= (delay_cnt == `MM_LATENCY - 1) ? 4'd0 : delay_cnt + 4'd1;
+
+            // main-memory fetch + L2 victim/evict bookkeeping
+            if (state == S_MM_DATA) begin
+                mm_rdata_r      <= mm_rdata;
+                l2_victim_way_r <= l2_victim_c;
+                if (l2_rvalid_all[l2_victim_c] && l2_rdirty_all[l2_victim_c]) begin
+                    l2_evict_tag_r  <= l2_tag_of(l2_victim_c, l2_rtag_all);
+                    l2_evict_data_r <= l2_data_of(l2_victim_c, l2_rdata_all);
+                end
+            end
+
+            // data to install into L1 once we reach S_L1_FILL
+            if (l1_installing_from_l2hit)
+                l1_fill_data_r <= l2_data_of(l2_hit_way_c, l2_rdata_all);
+            else if (l1_installing_from_fill)
+                l1_fill_data_r <= mm_rdata_r;
+
+            // snapshot of the L1 line about to be evicted, taken before
+            // it gets overwritten
+            if (l1_evict_trigger_c) begin
+                l1_evict_tag_r  <= l1_rtag;
+                l1_evict_data_r <= l1_rdata;
+            end
         end
     end
-    else
-    begin
-        //In case when the processor gives write operation
-        output_data=0;
-        if (L1_CACHE_MEMORY.l1_valid[l1_index]&& L1_CACHE_MEMORY.l1_tag_array[l1_index]==l1_tag)        //checking conditions for it to be present in L1 Cache
-        begin
-            //$display("Found in L1 Cache");
-            L1_CACHE_MEMORY.l1_cache_memory[l1_index][((offset+1)*byte_size-1)-:byte_size]=stored_data;     //if found change the data at the location
-            Wait=0;     //as it is found and the data is also changed, the controller is now ready to get new instructions from processor
-            hit1=1;     //indicates that it was found on L1 Cache
-            hit2=0;     //indicated that it was not found in L2 Cache
-        end
-        else
-        begin  //else if, when not found in L1 Cache, we start searching on L2 Cache
-            if((l2_delay_counter_w < l2_latency) && is_L2_delay_w==0)       //this is a small counter implementation to execute a delay for showing searching time in L2 Cache
-            begin 
-                l2_delay_counter_w=l2_delay_counter_w+1;        //increment the variable by 1 and check condition in every cycle
-                hit1=0; //till now its not found in L1 Cache
-                hit2=0; //till now its not found in L2 Cache
-                Wait=1; //indicates that the controller is busy at present and processor needs to wait till the controller completes the write operation
-            end
-            else
-            begin //Now, here is the code for checking if it is present in L2 Cache
-                l2_delay_counter_w=0;   //Reset the delay counter for L2 Cache to zero for next inputs
-                dummy_hit_w=0;     //We have still not found our required address
-                hit1=0;         //Not found in L1 Cache
-                hit2=0;         //Till now not found in L2 Cache
-                for (l2_checka=0;l2_checka<no_of_l2_ways;l2_checka=l2_checka+1)         //Linear searching on all 4 ways in the L2 Cache line
-                begin
-                    if (L2_CACHE_MEMORY.l2_valid[l2_index][l2_checka]&&L2_CACHE_MEMORY.l2_tag_array[l2_index][((l2_checka+1)*no_of_l2_tag_bits-1)-:no_of_l2_tag_bits]==l2_tag) //Comparing whether the address is required address or is the block valid
-                    begin
-                        dummy_hit_w=1;  //if we found the data in L2, hit=1... that is the data is found
-                        hit2=1;     //Found in L2 Cache
-                        hit1=0;     //Not found in L1 Cache
-                        Wait=0;      //We have found the required data ... so the process is complete and controller is ready for next input
-                        L2_CACHE_MEMORY.l2_cache_memory[l2_index][(l2_checka*l1_block_bit_size+(offset+1)*byte_size-1)-:byte_size]=stored_data;     //modify the data at address to input data
-                    end
-                end
-                if (dummy_hit_w==0)         //if still the address was not found, we start searching in main memory
-                begin
-                    hit1=0;     //Not found in L1 Cache
-                    hit2=0;     //Not found in L2 Cache
-                    if(main_memory_delay_counter_w < main_memory_latency)      //implementing the delay due to searching in main memory by running a counter
-                    begin
-                        main_memory_delay_counter_w=main_memory_delay_counter_w+1;  //incrementing the counter variable in each cycle
-                        hit1=0;        //Not found in L1 Cache
-                        hit2=0;         //Not found in L2 Cache
-                        Wait=1;         //still the search is going on and the processor needs to wait before giving another input
-                        is_L2_delay_w=1;    //No need to again check in L2 in next delay cycle in this counter
-                    end
-                    else
-                    begin
-                        main_memory_delay_counter_w=0;  //reset the main memory delay counter for next input
-                        hit1=0;     //not found in L1 Cache
-                        hit2=0;     //not found in L2 Cache
-                        Wait=0;       //Now found in Main memory ... so controller is ready for next instruction
-                        is_L2_delay_w=0;        //Check in L2 as well for next input 
-                        MAIN_MEMORY.main_memory[main_memory_blk_id][((offset+1)*byte_size-1)-:byte_size]=stored_data;       //modify the data in the given location in main memory
-                    end
-                end
-            end /*searching in L2 and Main ends here */
-        end    /*else not found in L1 ends here*/
-    end
-end
+
 endmodule
